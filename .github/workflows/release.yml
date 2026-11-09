@@ -15,6 +15,7 @@ concurrency:
 jobs:
   verify:
     name: Verify tag
+    if: github.repository == 'Ray-lea/Argus'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

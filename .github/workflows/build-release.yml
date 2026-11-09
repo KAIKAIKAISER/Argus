@@ -1,0 +1,135 @@
+name: Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag Name (e.g. v0.4.0-taskmgr)'
+        required: true
+        default: 'v0.4.0-taskmgr'
+      release_title:
+        description: 'Release Title'
+        required: false
+        default: 'Argus v0.4.0 (Windows Task Manager Icon)'
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    name: Build & Publish Release
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.14.0
+
+      - name: Install Rust Toolchain
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --no-self-update
+          rustup default stable-x86_64-pc-windows-msvc
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Determine Version & Tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+            TITLE="${{ github.event.inputs.release_title }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            TITLE="Argus ${GITHUB_REF_NAME} (Windows Task Manager Icon)"
+          fi
+          # Strip leading v for version string
+          VERSION="${TAG#v}"
+          echo "TAG_NAME=${TAG}" >> "$GITHUB_ENV"
+          echo "RELEASE_TITLE=${TITLE}" >> "$GITHUB_ENV"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Install NSIS
+        run: choco install nsis --version=3.13 -y --no-progress
+
+      - name: Build Helpers, App & Installer
+        env:
+          ARGUS_BUILD_METADATA: ""
+        run: |
+          node scripts/build.mjs --installer
+
+      - name: Collect Release Assets
+        run: |
+          mkdir -p dist
+          setup_file=$(ls target/release/bundle/nsis/*-setup.exe | head -n 1)
+          cp "$setup_file" "dist/Argus_${VERSION}_Setup.exe"
+          cp target/release/argus.exe "dist/Argus_${VERSION}_Portable.exe"
+          (cd dist && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      - name: Generate Release Notes
+        run: |
+          cat > release-notes.md << 'EOF'
+          # Argus (Windows 任务管理器图标定制版)
+
+          本版本由 GitHub Actions 在线自动编译构建。
+
+          ### 🎨 定制说明
+          - **软件外在图标全面替换**：
+            - `argus.exe` 可执行文件图标
+            - 运行时的 Windows 任务栏图标
+            - Alt+Tab 窗口切换图标
+            - 桌面及开始菜单图标
+            - 系统右下角常驻托盘（Tray）图标
+          - **软件内部 UI 图标全量替换**：
+            - 窗口标题栏左上角 Logo（18px）
+            - 关于页面（About Page）徽标（64px / 44px）
+            - 欢迎界面（Welcome Screen）标志（72px / 40px）
+          - 所有图标均采用 Windows 11 原生任务管理器 Fluent 官方高清多尺寸资产封装。
+
+          ### 📦 文件下载
+          - **`Argus_${VERSION}_Setup.exe`**：完整安装包（支持安装到系统、开机启动与快捷方式管理）。
+          - **`Argus_${VERSION}_Portable.exe`**：单文件便携绿色版（免安装，双击即可直接运行）。
+          - **`SHA256SUMS.txt`**：文件 SHA256 校验和列表。
+
+          ---
+          *上游开源项目：[Ray-lea/Argus](https://github.com/Ray-lea/Argus)*
+          EOF
+          # Replace placeholder ${VERSION} with actual version
+          sed -i "s/\${VERSION}/${VERSION}/g" release-notes.md
+
+      - name: Publish Release to GitHub
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Publishing release with tag: ${TAG_NAME}"
+          gh release view "${TAG_NAME}" 2>/dev/null && exists=1 || exists=0
+          if [ "$exists" -eq 1 ]; then
+            echo "Release ${TAG_NAME} already exists. Uploading assets..."
+            gh release upload "${TAG_NAME}" dist/* --clobber
+          else
+            echo "Creating new release ${TAG_NAME}..."
+            gh release create "${TAG_NAME}" dist/* \
+              --title "${RELEASE_TITLE}" \
+              --notes-file release-notes.md
+          fi
